@@ -1,16 +1,14 @@
 import esphome.codegen as cg
-from esphome.core import CORE
-from esphome.components.esp32 import add_idf_sdkconfig_option
 import esphome.config_validation as cv
 from esphome.components import ble_client
 from esphome.const import CONF_ID
 
 
-DEPENDENCIES = ['ble_client']
+DEPENDENCIES = ["ble_client"]
 AUTO_LOAD = ["sensor", "text_sensor"]
-CODE_OWNERS=["@fsievers22"]
+CODE_OWNERS = ["@fsievers22"]
 
-MULTI_CONF=3
+MULTI_CONF = 3
 
 ble_client_hid_ns = cg.esphome_ns.namespace("ble_client_hid")
 
@@ -19,11 +17,10 @@ BLEClientHID = ble_client_hid_ns.class_(
     cg.Component,
     ble_client.BLEClientNode,
 )
-
 CONFIG_SCHEMA = (
     cv.Schema(
         {
-            cv.GenerateID(): cv.declare_id(BLEClientHID)
+            cv.GenerateID(): cv.declare_id(BLEClientHID),
         }
     )
     .extend(cv.COMPONENT_SCHEMA)
