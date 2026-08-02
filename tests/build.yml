@@ -37,5 +37,8 @@ ble_client:
 ble_client_hid:
   - id: test_ble_hid
     ble_client_id: test_ble_client
+    event_sampling_interval: 500us
   - id: second_test_ble_hid
     ble_client_id: second_test_ble_client
+    discovery_mode: forensic
+    protocol_mode: report

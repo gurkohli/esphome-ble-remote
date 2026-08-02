@@ -1,14 +1,14 @@
-#include <map>
-#include <string>
+#pragma once
 
+#include <cstdint>
 
-struct UsagePage {
-  UsagePage(const char* name,
-            std::map<uint16_t, const char *> usages)
-      : name_(name), usages_(usages){};
-  const char* name_;
-  const std::map<uint16_t, const char *> usages_;
-  
-};
+namespace esphome {
+namespace ble_client_hid {
 
-extern const std::map<uint8_t, const UsagePage> USAGE_PAGES; 
+extern const char *const HID_USAGE_TABLE_VERSION;
+const char *lookup_usage_page_name(uint16_t page);
+const char *lookup_usage_name(uint16_t page, uint16_t usage);
+const char *lookup_usage_kinds(uint16_t page, uint16_t usage);
+
+}  // namespace ble_client_hid
+}  // namespace esphome
