@@ -49,15 +49,21 @@ int main() {
   const uint8_t xy[] = {0xFF, 0x2F, 0x00};  // X=-1, Y=2, packed 12-bit.
   values = map->parse(input_source(43, 2), xy, sizeof(xy));
   assert(values.size() == 2 && values[0].value == -1 && values[1].value == 2);
+  assert(values[0].aggregation == HIDReportItemValue::Aggregation::SUM);
+  assert(values[1].aggregation == HIDReportItemValue::Aggregation::SUM);
   const uint8_t mouse[] = {0x01, 0xFF, 0x01};
   values = map->parse(input_source(50, 3), mouse, sizeof(mouse));
   assert(values.size() == 3);
   assert(values[0].usage.page == 9 && values[0].usage.usage == 1 && values[0].value == 1);
+  assert(values[0].aggregation == HIDReportItemValue::Aggregation::PASSTHROUGH);
   assert(values[1].usage.page == 1 && values[1].usage.usage == 0x38 && values[1].value == -1);
   assert(values[2].usage.page == 0x0C && values[2].usage.usage == 0x238 && values[2].value == 1);
+  assert(values[2].aggregation == HIDReportItemValue::Aggregation::SUM);
   HIDReportSource output = input_source(47, 1);
   output.report_type = 2;
-  assert(map->parse(output, volume_up, sizeof(volume_up)).empty());
+  bool recognized = true;
+  assert(map->parse(output, volume_up, sizeof(volume_up), &recognized).empty());
+  assert(!recognized);
   delete map;
 
   // Array state is a set of asserted usages, not a slot-by-slot state. Merely
@@ -76,6 +82,73 @@ int main() {
   values = map->parse(no_id, key_5, sizeof(key_5));
   assert(values.size() == 1 && values[0].usage.usage == 4 && values[0].value == 0);
   delete map;
+
+  // Synthetic metadata fixture: nested collections, physical/unit metadata,
+  // strings/designators, aliases, and all three report kinds.
+  const uint8_t metadata_descriptor[] = {
+      0x05,0x01,0x09,0x04,0xA1,0x01,0x09,0x00,0xA1,0x02,0x85,0x01,
+      0x15,0x81,0x25,0x7F,0x36,0x18,0xFC,0x46,0xE8,0x03,0x55,0x0E,
+      0x65,0x11,0x05,0x09,0x09,0x01,0xA9,0x01,0x09,0x02,0xA9,0x00,
+      0x39,0x02,0x49,0x02,0x59,0x03,0x79,0x03,0x89,0x03,0x99,0x04,
+      0x75,0x08,0x95,0x01,0x81,0x02,0x05,0x01,0x09,0x31,0x91,0x02,
+      0x09,0x32,0xB1,0x02,0xC0,0xC0};
+  map = HIDReportMap::parse_report_map_data(metadata_descriptor, sizeof(metadata_descriptor));
+  assert(map != nullptr && map->valid() && map->uses_report_ids());
+  assert(map->collections().size() == 2);
+  assert(map->collections()[0].type == 1 && map->collections()[0].usage == HIDUsage(4, 1));
+  assert(map->collections()[1].parent == 0 && map->collections()[1].type == 2);
+  assert(map->reports().size() == 3 && map->fields().size() == 3);
+  const auto &metadata_field = map->fields()[0];
+  assert(metadata_field.kind == HIDReportKind::INPUT && metadata_field.logical.minimum == -127);
+  assert(metadata_field.physical.minimum == -1000 && metadata_field.physical.maximum == 1000);
+  assert(metadata_field.unit == 0x11 && metadata_field.unit_exponent == -2);
+  assert(metadata_field.usages.size() == 1 && metadata_field.usages[0] == HIDUsage(1, 9));
+  assert(metadata_field.alternative_usages.size() == 1);
+  assert(metadata_field.alternative_usages[0][0] == HIDUsage(2, 9));
+  assert(metadata_field.string_indices[0] == 3 && metadata_field.has_string_range);
+  assert(metadata_field.designator_indices[0] == 2 && metadata_field.has_designator_range);
+  assert(map->application_usage(metadata_field.collection_id) == HIDUsage(4, 1));
+  delete map;
+
+  // Report Count can define several scalar fields with the same Usage. Their
+  // bit positions, and therefore their field IDs, must remain distinct.
+  const uint8_t duplicate_usage_descriptor[] = {
+      0x05,0x09,0x09,0x01,0x15,0x00,0x25,0x01,0x75,0x01,0x95,0x02,0x81,0x02};
+  map = HIDReportMap::parse_report_map_data(duplicate_usage_descriptor, sizeof(duplicate_usage_descriptor));
+  assert(map != nullptr);
+  const uint8_t both_active[] = {0x03};
+  values = map->parse(HIDReportSource{}, both_active, sizeof(both_active));
+  assert(values.size() == 2 && values[0].usage == values[1].usage);
+  assert(values[0].field_id != values[1].field_id);
+  delete map;
+
+  // A short packet is rejected before it can mutate transition state.
+  const uint8_t one_button_descriptor[] = {
+      0x05,0x09,0x09,0x01,0x15,0x00,0x25,0x01,0x75,0x08,0x95,0x01,0x81,0x02};
+  map = HIDReportMap::parse_report_map_data(one_button_descriptor, sizeof(one_button_descriptor));
+  assert(map != nullptr);
+  const uint8_t pressed[] = {1};
+  HIDDecodeStatus decode_status = HIDDecodeStatus::SCHEMA_MISSING;
+  values = map->parse(HIDReportSource{}, pressed, sizeof(pressed), nullptr, &decode_status);
+  assert(values.size() == 1 && decode_status == HIDDecodeStatus::EXACT);
+  assert(map->parse(HIDReportSource{}, nullptr, 0, nullptr, &decode_status).empty());
+  assert(decode_status == HIDDecodeStatus::SHORT);
+  const uint8_t unpressed[] = {0};
+  values = map->parse(HIDReportSource{}, unpressed, sizeof(unpressed), nullptr, &decode_status);
+  assert(values.size() == 1 && values[0].value == 0);
+  const uint8_t long_packet[] = {1, 0xA5};
+  values = map->parse(HIDReportSource{}, long_packet, sizeof(long_packet), nullptr, &decode_status);
+  assert(values.size() == 1 && decode_status == HIDDecodeStatus::LONG);
+  delete map;
+
+  const uint8_t unmatched_end_collection[] = {0xC0};
+  assert(HIDReportMap::parse_report_map_data(unmatched_end_collection, sizeof(unmatched_end_collection)) == nullptr);
+  const uint8_t pop_without_push[] = {0xB4};
+  assert(HIDReportMap::parse_report_map_data(pop_without_push, sizeof(pop_without_push)) == nullptr);
+  const uint8_t nested_delimiter[] = {0xA9,0x01,0xA9,0x01,0x81,0x02};
+  assert(HIDReportMap::parse_report_map_data(nested_delimiter, sizeof(nested_delimiter)) == nullptr);
+  const uint8_t oversized_report[] = {0x75,0x20,0x96,0x01,0x10,0x81,0x02};
+  assert(HIDReportMap::parse_report_map_data(oversized_report, sizeof(oversized_report)) == nullptr);
 
   const uint8_t truncated_short[] = {0x75};
   assert(HIDReportMap::parse_report_map_data(truncated_short, sizeof(truncated_short)) == nullptr);
