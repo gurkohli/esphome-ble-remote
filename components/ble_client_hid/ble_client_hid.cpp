@@ -95,6 +95,11 @@ bool is_dis_characteristic(uint16_t uuid) {
   }
 }
 
+uint16_t uuid16_value(const espbt::ESPBTUUID &uuid) {
+  const esp_bt_uuid_t raw = uuid.get_uuid();
+  return raw.len == ESP_UUID_LEN_16 ? raw.uuid.uuid16 : 0;
+}
+
 [[maybe_unused]] const char *ad_type_name(uint8_t type) {
   switch (type) {
     case 0x01: return "flags";
@@ -177,7 +182,39 @@ void BLEClientHID::mark_degraded_(const std::string &reason) {
   ESP_LOGW(TAG, "HID_SETUP_WARNING phase=%s reason=%s", phase_name(this->setup_phase_), reason.c_str());
 }
 
+void BLEClientHID::setup() {
+#ifdef USE_BLE_CLIENT_HID_FORENSIC_WEB_LOGGING
+  if (this->forensic_web_logging_enabled_()) {
+    register_forensic_web_handler(this, this->forensic_web_path_);
+  }
+#endif
+}
+
 void BLEClientHID::reset_connection_state_() {
+#ifdef USE_BLE_CLIENT_HID_FORENSIC_WEB_LOGGING
+  {
+    LockGuard forensic_guard(this->forensic_export_mutex_);
+    this->forensic_snapshot_available_ = false;
+    this->forensic_operations_.clear();
+    this->forensic_operations_dropped_ = 0;
+    this->forensic_capture_started_ms_ = millis();
+    this->forensic_capture_completed_ms_ = 0;
+    this->forensic_next_operation_sequence_ = 1;
+    this->forensic_recording_events_.clear();
+    this->forensic_recording_events_dropped_ = 0;
+    this->forensic_recording_started_ms_ = 0;
+    this->forensic_next_recording_sequence_ = 1;
+    this->forensic_recording_active_ = false;
+    this->forensic_next_transaction_sequence_ = 1;
+    this->forensic_transaction_pending_.reset();
+    this->forensic_transaction_active_.reset();
+    this->forensic_gatt_write_active_.reset();
+    this->forensic_transaction_status_ = {};
+    this->forensic_transaction_result_variables_.clear();
+    this->forensic_transaction_responses_.reset();
+    this->forensic_transaction_reconnect_required_ = false;
+  }
+#endif
   this->services_.clear();
   this->hid_services_.clear();
   this->read_queue_.clear();
@@ -197,6 +234,11 @@ void BLEClientHID::reset_connection_state_() {
   this->sampling_window_active_ = false;
   this->preferred_conn_params_valid_ = false;
   this->preferred_conn_params_ = {};
+  this->negotiated_conn_params_available_ = false;
+  this->negotiated_conn_params_status_ = -1;
+  this->negotiated_mtu_available_ = false;
+  this->negotiated_mtu_status_ = -1;
+  this->negotiated_mtu_ = 0;
   this->protocol_write_handles_.clear();
   this->congested_ = false;
   this->rediscovery_requested_ = false;
@@ -204,10 +246,15 @@ void BLEClientHID::reset_connection_state_() {
   this->operations_failed_ = 0;
   this->degraded_ = false;
   this->gatt_profile_hash_.clear();
+  this->device_metadata_.clear();
 }
 
 void BLEClientHID::loop() {
   this->process_pending_advertisement_();
+
+#ifdef USE_BLE_CLIENT_HID_FORENSIC_WEB_LOGGING
+  this->process_forensic_transaction_();
+#endif
 
   if (this->rediscovery_requested_) {
     this->rediscovery_requested_ = false;
@@ -225,6 +272,9 @@ void BLEClientHID::loop() {
         this->status_set_warning("No HID service");
         this->transition_(SetupPhase::NO_HID);
         this->node_state = espbt::ClientState::ESTABLISHED;
+#ifdef USE_BLE_CLIENT_HID_FORENSIC_WEB_LOGGING
+        this->publish_forensic_snapshot_();
+#endif
       } else {
         this->plan_reads_();
         this->transition_(SetupPhase::READING);
@@ -329,6 +379,21 @@ const GattCharacteristicInfo *BLEClientHID::find_characteristic_(uint16_t handle
   for (const auto &service : this->services_)
     for (const auto &characteristic : service.characteristics)
       if (characteristic.handle == handle) return &characteristic;
+  return nullptr;
+}
+
+GattCharacteristicInfo *BLEClientHID::find_characteristic_(uint16_t handle) {
+  for (auto &service : this->services_)
+    for (auto &characteristic : service.characteristics)
+      if (characteristic.handle == handle) return &characteristic;
+  return nullptr;
+}
+
+GattDescriptorInfo *BLEClientHID::find_descriptor_by_handle_(uint16_t handle) {
+  for (auto &service : this->services_)
+    for (auto &characteristic : service.characteristics)
+      for (auto &descriptor : characteristic.descriptors)
+        if (descriptor.handle == handle) return &descriptor;
   return nullptr;
 }
 
@@ -500,7 +565,49 @@ bool BLEClientHID::add_read_(const GattServiceInfo &service, const GattCharacter
   operation.attribute_uuid = descriptor == nullptr ? characteristic.uuid : descriptor->uuid;
   this->read_queue_.push_back(std::move(operation));
   this->planned_read_handles_.insert(handle);
+  if (descriptor == nullptr) {
+    GattCharacteristicInfo *stored = this->find_characteristic_(handle);
+    if (stored != nullptr) stored->read_planned = true;
+  } else {
+    GattDescriptorInfo *stored = this->find_descriptor_by_handle_(handle);
+    if (stored != nullptr) stored->read_planned = true;
+  }
   return true;
+}
+
+void BLEClientHID::record_read_result_(const GattReadOperation &operation, bool complete, bool succeeded, int status,
+                                       const uint8_t *value, size_t length) {
+  GattCharacteristicInfo *characteristic = operation.descriptor ? nullptr : this->find_characteristic_(operation.handle);
+  GattDescriptorInfo *descriptor = operation.descriptor ? this->find_descriptor_by_handle_(operation.handle) : nullptr;
+  if (characteristic == nullptr && descriptor == nullptr) return;
+  bool &read_complete = characteristic != nullptr ? characteristic->read_complete : descriptor->read_complete;
+  bool &read_succeeded = characteristic != nullptr ? characteristic->read_succeeded : descriptor->read_succeeded;
+  int &read_status = characteristic != nullptr ? characteristic->read_status : descriptor->read_status;
+  size_t &value_length = characteristic != nullptr ? characteristic->value_length : descriptor->value_length;
+  bool &value_truncated = characteristic != nullptr ? characteristic->value_truncated : descriptor->value_truncated;
+  std::vector<uint8_t> &stored_value = characteristic != nullptr ? characteristic->value : descriptor->value;
+  read_complete = complete;
+  read_succeeded = succeeded;
+  read_status = status;
+  value_length = length;
+  size_t stored_length = std::min(length, MAX_TREE_VALUE_BYTES);
+#ifdef USE_BLE_CLIENT_HID_FORENSIC_WEB_LOGGING
+  if (this->forensic_web_logging_enabled_() && this->discovery_mode_ == DiscoveryMode::FORENSIC)
+    stored_length = length;
+#endif
+  value_truncated = length > stored_length;
+  if (succeeded) {
+    if (stored_length == 0) stored_value.clear();
+    else stored_value.assign(value, value + stored_length);
+  } else {
+    stored_value.clear();
+  }
+#ifdef USE_BLE_CLIENT_HID_FORENSIC_WEB_LOGGING
+  this->record_forensic_operation_(operation.descriptor ? "descriptor_read" : "characteristic_read",
+                                   complete ? "completed" : "incomplete", operation.handle,
+                                   operation.characteristic_handle, "gatt", status, complete, succeeded,
+                                   succeeded ? value : nullptr, succeeded ? length : 0);
+#endif
 }
 
 void BLEClientHID::plan_reads_() {
@@ -583,6 +690,7 @@ void BLEClientHID::start_next_read_() {
   if (status != ESP_OK) {
     const bool required = this->active_read_->required;
     ESP_LOGW(TAG, "GATT_READ handle=%u status=schedule_failed code=%d", this->active_read_->handle, status);
+    this->record_read_result_(*this->active_read_, true, false, status);
     this->active_read_.reset();
     if (required) this->mark_degraded_("required GATT read could not be scheduled");
     else this->operations_failed_++;
@@ -599,6 +707,7 @@ void BLEClientHID::finish_active_read_(esp_gatt_status_t status, const uint8_t *
   if (status != ESP_GATT_OK) {
     ESP_LOGW(TAG, "GATT_READ handle=%u uuid=%s status=failed code=%d", operation.handle,
              uuid_string_(operation.attribute_uuid).c_str(), status);
+    this->record_read_result_(operation, true, false, status);
     if (operation.required) this->mark_degraded_("required GATT read failed");
     else this->operations_failed_++;
     return;
@@ -606,11 +715,13 @@ void BLEClientHID::finish_active_read_(esp_gatt_status_t status, const uint8_t *
   if (length > MAX_ATTRIBUTE_VALUE_BYTES) {
     ESP_LOGW(TAG, "GATT_READ handle=%u status=value_too_large length=%u limit=%u", operation.handle,
              static_cast<unsigned>(length), static_cast<unsigned>(MAX_ATTRIBUTE_VALUE_BYTES));
+    this->record_read_result_(operation, true, false, ESP_GATT_INVALID_ATTR_LEN);
     if (operation.required) this->mark_degraded_("required GATT value exceeded limit");
     else this->operations_failed_++;
     return;
   }
   this->operations_succeeded_++;
+  this->record_read_result_(operation, true, true, status, value, length);
   this->process_read_value_(operation, value, length);
 }
 
@@ -625,21 +736,26 @@ void BLEClientHID::process_read_value_(const GattReadOperation &operation, const
   }
   switch (operation.purpose) {
     case ReadPurpose::DEVICE_NAME:
+      this->device_metadata_["name"] = printable_text(value, length);
       ESP_LOGD(TAG, "HID_DEVICE field=device_name len=%u value=%s", static_cast<unsigned>(length),
                printable_text(value, length).c_str());
       break;
     case ReadPurpose::MANUFACTURER:
+      this->device_metadata_["manufacturer"] = printable_text(value, length);
       ESP_LOGD(TAG, "HID_DEVICE field=manufacturer len=%u value=%s", static_cast<unsigned>(length),
                printable_text(value, length).c_str());
       break;
     case ReadPurpose::SERIAL_NUMBER:
+      this->device_metadata_["serial_number"] = printable_text(value, length);
       ESP_LOGD(TAG, "HID_DEVICE field=serial_number len=%u value=%s privacy=sensitive",
                static_cast<unsigned>(length), printable_text(value, length).c_str());
       break;
     case ReadPurpose::APPEARANCE:
-      if (length == 2)
+      if (length == 2) {
+        const uint16_t appearance = value[0] | (static_cast<uint16_t>(value[1]) << 8U);
+        this->device_metadata_["appearance"] = str_sprintf("%u (0x%04X)", appearance, appearance);
         ESP_LOGD(TAG, "HID_DEVICE field=appearance value=%u", value[0] | (static_cast<uint16_t>(value[1]) << 8U));
-      else
+      } else
         this->mark_degraded_("Appearance has invalid length");
       break;
     case ReadPurpose::PREFERRED_CONNECTION_PARAMETERS:
@@ -650,6 +766,10 @@ void BLEClientHID::process_read_value_(const GattReadOperation &operation, const
         this->preferred_conn_params_.timeout = value[6] | (static_cast<uint16_t>(value[7]) << 8U);
         memcpy(this->preferred_conn_params_.bda, this->parent()->get_remote_bda(), sizeof(esp_bd_addr_t));
         this->preferred_conn_params_valid_ = true;
+        this->device_metadata_["preferred_connection_parameters"] = str_sprintf(
+            "min_interval=%.2fms max_interval=%.2fms latency=%u timeout=%.1fms",
+            this->preferred_conn_params_.min_int * 1.25f, this->preferred_conn_params_.max_int * 1.25f,
+            this->preferred_conn_params_.latency, this->preferred_conn_params_.timeout * 10.0f);
       } else {
         this->mark_degraded_("Preferred Connection Parameters have invalid length");
       }
@@ -657,6 +777,7 @@ void BLEClientHID::process_read_value_(const GattReadOperation &operation, const
     case ReadPurpose::BATTERY_LEVEL:
       this->battery_handles_.insert(operation.characteristic_handle);
       if (length >= 1) {
+        this->device_metadata_["battery"] = str_sprintf("%u%%", value[0]);
         ESP_LOGD(TAG, "HID_BATTERY source=read value=%u", value[0]);
         if (this->battery_sensor_ != nullptr) this->battery_sensor_->publish_state(value[0]);
       } else {
@@ -668,6 +789,9 @@ void BLEClientHID::process_read_value_(const GattReadOperation &operation, const
         const uint16_t vendor_id = value[1] | (static_cast<uint16_t>(value[2]) << 8U);
         const uint16_t product_id = value[3] | (static_cast<uint16_t>(value[4]) << 8U);
         const uint16_t version = value[5] | (static_cast<uint16_t>(value[6]) << 8U);
+        this->device_metadata_["pnp_id"] = str_sprintf(
+            "source=%u vendor_id=%u (0x%04X) product_id=%u (0x%04X) version=%u (0x%04X)", value[0],
+            vendor_id, vendor_id, product_id, product_id, version, version);
         ESP_LOGD(TAG, "HID_DEVICE field=pnp_id source=%u vendor_id=%u product_id=%u version=%u", value[0],
                  vendor_id, product_id, version);
       } else {
@@ -677,6 +801,8 @@ void BLEClientHID::process_read_value_(const GattReadOperation &operation, const
     case ReadPurpose::HID_INFORMATION: {
       HIDServiceContext *context = this->find_hid_context_(operation.service_instance);
       if (context != nullptr && length == 4) {
+        this->device_metadata_["hid_information"] = str_sprintf(
+            "version=0x%02X%02X country=%u flags=0x%02X", value[1], value[0], value[2], value[3]);
         ESP_LOGD(TAG, "HID_INFO service_instance=%u bcd_hid=0x%02X%02X country=%u flags=0x%02X",
                  operation.service_instance, value[1], value[0], value[2], value[3]);
       } else {
@@ -689,6 +815,8 @@ void BLEClientHID::process_read_value_(const GattReadOperation &operation, const
       if (context != nullptr && length == 1) {
         context->protocol_mode = value[0];
         context->protocol_mode_handle = operation.characteristic_handle;
+        this->device_metadata_["protocol_mode"] = value[0] == 0 ? "boot (0)" : value[0] == 1 ? "report (1)" :
+                                                                   str_sprintf("unknown (%u)", value[0]);
         ESP_LOGD(TAG, "HID_PROTOCOL service_instance=%u mode=%s raw=%u", operation.service_instance,
                  value[0] == 0 ? "boot" : value[0] == 1 ? "report" : "unknown", value[0]);
       } else {
@@ -737,6 +865,24 @@ void BLEClientHID::process_read_value_(const GattReadOperation &operation, const
       else
         this->mark_degraded_("External Report Reference has unsupported length");
       break;
+    case ReadPurpose::GENERIC_STANDARD: {
+      const uint16_t uuid = uuid16_value(operation.attribute_uuid);
+      const char *key = nullptr;
+      switch (uuid) {
+        case UUID_SYSTEM_ID: key = "system_id"; break;
+        case UUID_MODEL_NUMBER: key = "model_number"; break;
+        case UUID_FIRMWARE_REVISION: key = "firmware_revision"; break;
+        case UUID_HARDWARE_REVISION: key = "hardware_revision"; break;
+        case UUID_SOFTWARE_REVISION: key = "software_revision"; break;
+        case UUID_IEEE_CERTIFICATION: key = "ieee_certification"; break;
+        default: break;
+      }
+      if (key != nullptr) {
+        const std::string text_value = printable_text(value, length);
+        this->device_metadata_[key] = text_value.find_first_not_of('.') == std::string::npos ? raw : text_value;
+      }
+      break;
+    }
     default:
       break;
   }
@@ -859,6 +1005,10 @@ void BLEClientHID::start_protocol_mode_write_() {
   } else {
     this->mark_degraded_("Protocol Mode write failed");
   }
+#ifdef USE_BLE_CLIENT_HID_FORENSIC_WEB_LOGGING
+  this->record_forensic_operation_("characteristic_write", "scheduled", handle, 0, "esp_err", status, true,
+                                   status == ESP_OK, &value, 1);
+#endif
 }
 
 void BLEClientHID::plan_subscriptions_() {
@@ -886,6 +1036,11 @@ void BLEClientHID::plan_subscriptions_() {
       const GattDescriptorInfo *cccd = this->find_descriptor_(characteristic, UUID_CCCD);
       if (cccd != nullptr) subscription.cccd_handle = cccd->handle;
       this->subscription_queue_.push_back(subscription);
+      GattCharacteristicInfo *stored = this->find_characteristic_(characteristic.handle);
+      if (stored != nullptr) {
+        stored->subscription_planned = true;
+        stored->cccd_handle = subscription.cccd_handle;
+      }
       if (battery) this->battery_handles_.insert(characteristic.handle);
       if (service_changed) this->service_changed_handles_.insert(characteristic.handle);
     }
@@ -908,6 +1063,13 @@ void BLEClientHID::start_next_subscription_() {
   if (this->active_subscription_->cccd_handle == 0) {
     ESP_LOGW(TAG, "HID_SUBSCRIPTION handle=%u status=failed reason=missing_cccd",
              this->active_subscription_->characteristic_handle);
+    GattCharacteristicInfo *stored = this->find_characteristic_(this->active_subscription_->characteristic_handle);
+    if (stored != nullptr) stored->subscription_complete = true;
+#ifdef USE_BLE_CLIENT_HID_FORENSIC_WEB_LOGGING
+    this->record_forensic_operation_("subscription", "missing_cccd",
+                                     this->active_subscription_->characteristic_handle, 0, "local", -1, true,
+                                     false);
+#endif
     if (this->active_subscription_->required) this->mark_degraded_("required notification has no CCCD");
     else this->operations_failed_++;
     this->active_subscription_.reset();
@@ -920,6 +1082,19 @@ void BLEClientHID::start_next_subscription_() {
   if (status != ESP_OK) {
     ESP_LOGW(TAG, "HID_SUBSCRIPTION handle=%u status=registration_schedule_failed code=%d",
              this->active_subscription_->characteristic_handle, status);
+    GattCharacteristicInfo *stored = this->find_characteristic_(this->active_subscription_->characteristic_handle);
+    if (stored != nullptr) {
+      stored->subscription_complete = true;
+      stored->subscription_status = status;
+      stored->registration_complete = true;
+      stored->registration_status = status;
+      stored->registration_status_is_esp_err = true;
+    }
+#ifdef USE_BLE_CLIENT_HID_FORENSIC_WEB_LOGGING
+    this->record_forensic_operation_("subscription_registration", "schedule_failed",
+                                     this->active_subscription_->characteristic_handle,
+                                     this->active_subscription_->cccd_handle, "esp_err", status, true, false);
+#endif
     if (this->active_subscription_->required) this->mark_degraded_("required notification registration failed");
     else this->operations_failed_++;
     this->active_subscription_.reset();
@@ -936,6 +1111,22 @@ void BLEClientHID::handle_registration_result_(uint16_t handle, esp_gatt_status_
   }
   if (decision == SubscriptionDecision::FAILED) {
     ESP_LOGW(TAG, "HID_SUBSCRIPTION handle=%u status=registration_failed code=%d", handle, status);
+    if (status == ESP_GATT_NO_RESOURCES) {
+      ESP_LOGW(TAG,
+               "HID_CONFIGURATION_HINT reason=notification_registration_capacity_exhausted "
+               "action=increase_max_notifications example=\"esp32_ble: { max_notifications: 32 }\"");
+    }
+    GattCharacteristicInfo *stored = this->find_characteristic_(handle);
+    if (stored != nullptr) {
+      stored->subscription_complete = true;
+      stored->subscription_status = status;
+      stored->registration_complete = true;
+      stored->registration_status = status;
+    }
+#ifdef USE_BLE_CLIENT_HID_FORENSIC_WEB_LOGGING
+    this->record_forensic_operation_("subscription_registration", "callback", handle,
+                                     this->active_subscription_->cccd_handle, "gatt", status, true, false);
+#endif
     if (this->active_subscription_->required) this->mark_degraded_("required notification registration failed");
     else this->operations_failed_++;
     this->active_subscription_.reset();
@@ -945,6 +1136,15 @@ void BLEClientHID::handle_registration_result_(uint16_t handle, esp_gatt_status_
   }
   ESP_LOGV(TAG, "HID_SUBSCRIPTION handle=%u status=registered cccd_handle=%u", handle,
            this->active_subscription_->cccd_handle);
+  if (GattCharacteristicInfo *stored = this->find_characteristic_(handle); stored != nullptr) {
+    stored->registration_complete = true;
+    stored->registration_succeeded = true;
+    stored->registration_status = status;
+  }
+#ifdef USE_BLE_CLIENT_HID_FORENSIC_WEB_LOGGING
+  this->record_forensic_operation_("subscription_registration", "callback", handle,
+                                   this->active_subscription_->cccd_handle, "gatt", status, true, true);
+#endif
   this->transition_(SetupPhase::WAITING_FOR_CCCD);
 }
 
@@ -958,6 +1158,20 @@ void BLEClientHID::write_current_cccd_() {
   if (status != ESP_OK) {
     ESP_LOGW(TAG, "HID_SUBSCRIPTION handle=%u cccd_handle=%u status=cccd_schedule_failed code=%d",
              this->active_subscription_->characteristic_handle, this->active_subscription_->cccd_handle, status);
+    GattCharacteristicInfo *stored = this->find_characteristic_(this->active_subscription_->characteristic_handle);
+    if (stored != nullptr) {
+      stored->subscription_complete = true;
+      stored->subscription_status = status;
+      stored->cccd_write_complete = true;
+      stored->cccd_write_status = status;
+      stored->cccd_write_status_is_esp_err = true;
+    }
+#ifdef USE_BLE_CLIENT_HID_FORENSIC_WEB_LOGGING
+    this->record_forensic_operation_("descriptor_write", "schedule_failed",
+                                     this->active_subscription_->cccd_handle,
+                                     this->active_subscription_->characteristic_handle, "esp_err", status, true,
+                                     false, reinterpret_cast<const uint8_t *>(&value), sizeof(value));
+#endif
     if (this->active_subscription_->required) this->mark_degraded_("required CCCD write failed");
     else this->operations_failed_++;
     this->active_subscription_.reset();
@@ -969,12 +1183,33 @@ void BLEClientHID::write_current_cccd_() {
 void BLEClientHID::handle_cccd_result_(uint16_t handle, esp_gatt_status_t status) {
   const SubscriptionDecision decision = this->subscription_state_.cccd_result(handle, status == ESP_GATT_OK);
   if (this->active_subscription_ == nullptr || decision == SubscriptionDecision::UNMATCHED) {
-    ESP_LOGV(TAG, "HID_SUBSCRIPTION cccd_handle=%u status=unmatched_write_callback code=%d", handle, status);
+    ESP_LOGV(TAG,
+             "HID_SUBSCRIPTION cccd_handle=%u status=stale_or_external_cccd_write code=%d "
+             "effect=not_used_as_subscription_evidence",
+             handle, status);
+#ifdef USE_BLE_CLIENT_HID_FORENSIC_WEB_LOGGING
+    this->record_forensic_operation_("descriptor_write", "unmatched_callback", handle, 0, "gatt", status, true,
+                                     status == ESP_GATT_OK);
+#endif
     return;
   }
   if (decision == SubscriptionDecision::COMPLETE) {
-    ESP_LOGD(TAG, "HID_SUBSCRIPTION handle=%u cccd_handle=%u status=enabled",
+    ESP_LOGD(TAG, "HID_SUBSCRIPTION handle=%u cccd_handle=%u status=enabled registration=confirmed cccd=confirmed",
              this->active_subscription_->characteristic_handle, handle);
+    GattCharacteristicInfo *stored = this->find_characteristic_(this->active_subscription_->characteristic_handle);
+    if (stored != nullptr) {
+      stored->subscription_complete = true;
+      stored->subscription_enabled = true;
+      stored->subscription_status = status;
+      stored->cccd_write_complete = true;
+      stored->cccd_write_succeeded = true;
+      stored->cccd_write_status = status;
+    }
+#ifdef USE_BLE_CLIENT_HID_FORENSIC_WEB_LOGGING
+    this->record_forensic_operation_("descriptor_write", "callback", handle,
+                                     this->active_subscription_->characteristic_handle, "gatt", status, true,
+                                     true);
+#endif
     this->operations_succeeded_++;
     this->active_subscription_.reset();
     this->subscription_state_.reset();
@@ -984,11 +1219,27 @@ void BLEClientHID::handle_cccd_result_(uint16_t handle, esp_gatt_status_t status
   if (decision == SubscriptionDecision::RETRY_CCCD) {
     ESP_LOGW(TAG, "HID_SUBSCRIPTION handle=%u cccd_handle=%u status=framework_write_failed code=%d action=retry",
              this->active_subscription_->characteristic_handle, handle, status);
+#ifdef USE_BLE_CLIENT_HID_FORENSIC_WEB_LOGGING
+    this->record_forensic_operation_("descriptor_write", "framework_callback_retry", handle,
+                                     this->active_subscription_->characteristic_handle, "gatt", status, true,
+                                     false);
+#endif
     this->write_current_cccd_();
     return;
   }
   ESP_LOGW(TAG, "HID_SUBSCRIPTION handle=%u cccd_handle=%u status=failed code=%d",
            this->active_subscription_->characteristic_handle, handle, status);
+  GattCharacteristicInfo *stored = this->find_characteristic_(this->active_subscription_->characteristic_handle);
+  if (stored != nullptr) {
+    stored->subscription_complete = true;
+    stored->subscription_status = status;
+    stored->cccd_write_complete = true;
+    stored->cccd_write_status = status;
+  }
+#ifdef USE_BLE_CLIENT_HID_FORENSIC_WEB_LOGGING
+  this->record_forensic_operation_("descriptor_write", "callback", handle,
+                                   this->active_subscription_->characteristic_handle, "gatt", status, true, false);
+#endif
   if (this->active_subscription_->required) this->mark_degraded_("required CCCD write failed");
   else this->operations_failed_++;
   this->active_subscription_.reset();
@@ -1010,12 +1261,22 @@ void BLEClientHID::finalize_setup_() {
            static_cast<unsigned>(this->hid_services_.size()), static_cast<unsigned>(this->operations_succeeded_),
            static_cast<unsigned>(this->operations_failed_), this->gatt_profile_hash_.c_str());
   this->node_state = espbt::ClientState::ESTABLISHED;
+#ifdef USE_BLE_CLIENT_HID_FORENSIC_WEB_LOGGING
+  this->publish_forensic_snapshot_();
+#endif
 }
 
 void BLEClientHID::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
                                        esp_ble_gattc_cb_param_t *param) {
   if (param == nullptr || (gattc_if != ESP_GATT_IF_NONE && gattc_if != this->parent()->get_gattc_if())) return;
   switch (event) {
+    case ESP_GATTC_CFG_MTU_EVT:
+      if (param->cfg_mtu.conn_id == this->parent()->get_conn_id()) {
+        this->negotiated_mtu_available_ = true;
+        this->negotiated_mtu_status_ = param->cfg_mtu.status;
+        this->negotiated_mtu_ = param->cfg_mtu.mtu;
+      }
+      break;
     case ESP_GATTC_CONNECT_EVT:
       if (memcmp(param->connect.remote_bda, this->parent()->get_remote_bda(), sizeof(esp_bd_addr_t)) != 0) break;
       this->reset_connection_state_();
@@ -1052,14 +1313,27 @@ void BLEClientHID::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t
       this->handle_registration_result_(param->reg_for_notify.handle, param->reg_for_notify.status);
       break;
     case ESP_GATTC_WRITE_DESCR_EVT:
+      if (param->write.conn_id != this->parent()->get_conn_id()) break;
+#ifdef USE_BLE_CLIENT_HID_FORENSIC_WEB_LOGGING
+      if (this->finish_forensic_transaction_write_(true, param->write.handle, param->write.status)) break;
+#endif
+      this->handle_cccd_result_(param->write.handle, param->write.status);
+      break;
+    case ESP_GATTC_WRITE_CHAR_EVT:
+#ifdef USE_BLE_CLIENT_HID_FORENSIC_WEB_LOGGING
       if (param->write.conn_id == this->parent()->get_conn_id())
-        this->handle_cccd_result_(param->write.handle, param->write.status);
+        this->finish_forensic_transaction_write_(false, param->write.handle, param->write.status);
+#endif
       break;
     case ESP_GATTC_NOTIFY_EVT: {
       if (param->notify.conn_id != this->parent()->get_conn_id() ||
           memcmp(param->notify.remote_bda, this->parent()->get_remote_bda(), sizeof(esp_bd_addr_t)) != 0)
         break;
       const uint64_t seq_id = this->log_raw_notification_(param->notify);
+#ifdef USE_BLE_CLIENT_HID_FORENSIC_WEB_LOGGING
+      this->process_forensic_transaction_notification_(param->notify.handle, param->notify.is_notify,
+                                                       param->notify.value, param->notify.value_len);
+#endif
       if (this->service_changed_handles_.count(param->notify.handle) != 0) {
         ESP_LOGW(TAG, "HID_SERVICE_CHANGED seq_id=%llu action=invalidate_profile",
                  static_cast<unsigned long long>(seq_id));
@@ -1112,6 +1386,11 @@ void BLEClientHID::gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_c
   if (param == nullptr || event != ESP_GAP_BLE_UPDATE_CONN_PARAMS_EVT ||
       memcmp(param->update_conn_params.bda, this->parent()->get_remote_bda(), sizeof(esp_bd_addr_t)) != 0)
     return;
+  this->negotiated_conn_params_available_ = true;
+  this->negotiated_conn_params_status_ = param->update_conn_params.status;
+  this->negotiated_interval_ms_ = param->update_conn_params.conn_int * 1.25f;
+  this->negotiated_latency_ = param->update_conn_params.latency;
+  this->negotiated_timeout_ms_ = param->update_conn_params.timeout * 10.0f;
   ESP_LOGI(TAG, "HID_CONNECTION_PARAMETERS status=%d interval_ms=%.2f latency=%u timeout_ms=%.1f",
            param->update_conn_params.status, param->update_conn_params.conn_int * 1.25f,
            param->update_conn_params.latency, param->update_conn_params.timeout * 10.0f);
@@ -1139,6 +1418,10 @@ uint64_t BLEClientHID::log_raw_notification_(
            static_cast<unsigned long long>(seq_id), classification, service_instance, handle, uuid.c_str(),
            report_id.c_str(), report_type, notification.is_notify ? "notify" : "indicate",
            notification.value_len, raw.c_str());
+#ifdef USE_BLE_CLIENT_HID_FORENSIC_WEB_LOGGING
+  this->record_forensic_operation_(notification.is_notify ? "notification" : "indication", "received", handle, 0,
+                                   "gatt", ESP_GATT_OK, true, true, notification.value, notification.value_len);
+#endif
   return seq_id;
 }
 
@@ -1366,6 +1649,10 @@ void BLEClientHID::process_pending_advertisement_() {
   if (!this->pending_advertisement_.available) return;
   PendingAdvertisement advertisement = this->pending_advertisement_;
   this->pending_advertisement_.available = false;
+  this->last_advertisement_data_length_ = advertisement.advertisement_length;
+  this->last_scan_response_length_ = advertisement.scan_response_length;
+  this->last_address_type_ = advertisement.address_type;
+  this->last_rssi_ = advertisement.rssi;
   ESP_LOGD(TAG, "BLE_ADV address=%s address_type=%u rssi=%d adv_len=%u scan_rsp_len=%u adv_data=%s scan_rsp_data=%s",
            this->parent()->address_str(), advertisement.address_type, advertisement.rssi,
            advertisement.advertisement_length, advertisement.scan_response_length,

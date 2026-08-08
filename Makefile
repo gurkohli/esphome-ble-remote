@@ -19,6 +19,8 @@ test:
 	/tmp/boot_report_decoder_test
 	$(CXX) -std=c++20 -Wall -Wextra -Werror -Icomponents/ble_client_hid tests/subscription_state_test.cpp -o /tmp/subscription_state_test
 	/tmp/subscription_state_test
+	$(CXX) -std=c++20 -Wall -Wextra -Werror -Icomponents/ble_client_hid tests/forensic_transaction_test.cpp components/ble_client_hid/forensic_web_logging/forensic_transaction.cpp components/ble_client_hid/forensic_web_logging/bluetooth_e1.cpp -o /tmp/forensic_transaction_test
+	/tmp/forensic_transaction_test
 
 test-sanitize:
 	$(CXX) -std=c++20 -Wall -Wextra -Werror -fsanitize=address,undefined -fno-omit-frame-pointer -Icomponents/ble_client_hid tests/hid_item_value_test.cpp -o /tmp/hid_item_value_test_sanitize
@@ -33,6 +35,8 @@ test-sanitize:
 	/tmp/boot_report_decoder_test_sanitize
 	$(CXX) -std=c++20 -Wall -Wextra -Werror -fsanitize=address,undefined -fno-omit-frame-pointer -Icomponents/ble_client_hid tests/subscription_state_test.cpp -o /tmp/subscription_state_test_sanitize
 	/tmp/subscription_state_test_sanitize
+	$(CXX) -std=c++20 -Wall -Wextra -Werror -fsanitize=address,undefined -fno-omit-frame-pointer -Icomponents/ble_client_hid tests/forensic_transaction_test.cpp components/ble_client_hid/forensic_web_logging/forensic_transaction.cpp components/ble_client_hid/forensic_web_logging/bluetooth_e1.cpp -o /tmp/forensic_transaction_test_sanitize
+	/tmp/forensic_transaction_test_sanitize
 
 build: setup
 	$(ESPHOME) -s build_board $(BOARD) clean $(BUILD_CONFIG)

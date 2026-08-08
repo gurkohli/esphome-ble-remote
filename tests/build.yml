@@ -25,6 +25,9 @@ wifi:
 api:
   homeassistant_services: true
 
+web_server:
+  version: 3
+
 external_components:
   - source:
       type: local
@@ -46,4 +49,5 @@ ble_client_hid:
   - id: second_test_ble_hid
     ble_client_id: second_test_ble_client
     discovery_mode: forensic
+    forensic_enable_web_logs: true
     protocol_mode: report
