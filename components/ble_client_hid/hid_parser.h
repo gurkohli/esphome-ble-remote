@@ -1,170 +1,188 @@
 #pragma once
 
-namespace esphome
-{
-  namespace ble_client_hid
-  {
+#include <cstddef>
+#include <cstdint>
+#include <map>
+#include <string>
+#include <vector>
 
-    struct HIDUsage
-    {
-      HIDUsage(uint16_t usage, uint16_t page) : usage(usage), page(page){};
-      uint16_t usage = 0;
-      uint16_t page = 0;
-    };
+namespace esphome {
+namespace ble_client_hid {
 
-    struct HIDReportItemValue
-    {
-      HIDReportItemValue(const HIDUsage usage, const int32_t value, const int32_t raw_value)
-          : usage(usage), value(value), raw_value(raw_value){};
-      std::string to_string() const;
-      HIDUsage usage;
-      int32_t value = 0;
-      int32_t raw_value = 0;
-    };
+struct HIDUsage {
+  uint16_t usage{0};
+  uint16_t page{0};
 
-    struct HIDUsageRangeLimits
-    {
-      HIDUsage minimum = HIDUsage(0, 0);
-      HIDUsage maximum = HIDUsage(0, 0);
-    };
+  HIDUsage() = default;
+  HIDUsage(uint16_t usage, uint16_t page) : usage(usage), page(page) {}
+  bool operator==(const HIDUsage &other) const { return this->page == other.page && this->usage == other.usage; }
+  bool operator<(const HIDUsage &other) const {
+    return this->page < other.page || (this->page == other.page && this->usage < other.usage);
+  }
+};
 
-    struct HIDLogicalRange
-    {
-      int32_t minimum = 0;
-      int32_t maximum = 0;
-    };
+enum class HIDReportKind : uint8_t {
+  INPUT = 1,
+  OUTPUT = 2,
+  FEATURE = 3,
+};
 
-    struct HIDStateTable
-    {
-      uint8_t report_size = 0; // in bits
-      HIDLogicalRange logical_range = {};
-      uint8_t report_count = 0;
-      uint8_t report_id = 0;
-      uint16_t usage_page = 0;
-    };
+enum class HIDDecodeStatus : uint8_t {
+  EXACT,
+  LONG,
+  SHORT,
+  SCHEMA_MISSING,
+  REPORT_KIND_MISMATCH,
+  BOOT_REPORT,
+  INVALID_PAYLOAD,
+};
 
-    class HIDUsageCollection
-    {
-    public:
-      virtual const HIDUsage get_usage(uint16_t index) const = 0;
-      virtual ~HIDUsageCollection() = default;
-    };
+const char *hid_report_kind_name(HIDReportKind kind);
+const char *hid_decode_status_name(HIDDecodeStatus status);
 
-    class HIDUsageRange : public HIDUsageCollection
-    {
-    public:
-      HIDUsageRange(const HIDUsage usage_min, const HIDUsage usage_max, uint16_t usage_page)
-          : usage_min(usage_min), usage_max(usage_max), usage_page(usage_page){};
-      const HIDUsage get_usage(uint16_t index) const;
+struct HIDReportSource {
+  uint16_t service_instance{0};
+  uint16_t characteristic_handle{0};
+  uint8_t report_id{0};
+  bool has_report_id{false};
+  uint8_t report_type{0};
+  bool has_report_type{false};
+  bool is_notification{true};
+  bool has_transport{false};
+  uint16_t characteristic_uuid{0};
+};
 
-    protected:
-      const HIDUsage usage_min;
-      const HIDUsage usage_max;
-      const uint16_t usage_page;
-    };
+struct HIDRange {
+  int64_t minimum{0};
+  int64_t maximum{0};
+};
 
-    class HIDUsageList : public HIDUsageCollection
-    {
-    public:
-      HIDUsageList(std::vector<HIDUsage> usages) : usages(usages){};
-      const HIDUsage get_usage(uint16_t index) const;
+struct HIDCollectionSchema {
+  static constexpr uint16_t NO_PARENT = UINT16_MAX;
 
-    protected:
-      std::vector<HIDUsage> usages;
-    };
+  uint16_t id{0};
+  uint16_t parent{NO_PARENT};
+  uint8_t type{0};
+  HIDUsage usage{};
+  std::vector<HIDUsage> aliases;
+};
 
-    class HIDInputReportItem
-    {
-    public:
-      HIDInputReportItem(HIDUsageCollection *usage_collection, uint8_t report_count, uint8_t report_id,
-                         HIDLogicalRange logical_range, uint8_t report_size, uint8_t report_offset)
-          : report_size(report_size),
-            usage_collection(usage_collection),
-            report_count(report_count),
-            report_id(report_id),
-            logical_range(logical_range),
-            report_offset(report_offset)
-      {
-        this->last_values = std::vector<HIDReportItemValue>(report_count, HIDReportItemValue(HIDUsage(0, 0), 0, 0));
-      }
-      virtual ~HIDInputReportItem()
-      {
-        delete usage_collection;
-      };
-      size_t get_total_size();
-      virtual std::vector<HIDReportItemValue> parse(uint8_t *hid_report_data) = 0;
-      static int32_t parse_input_report_item(uint8_t *report_data, uint16_t bit_offset, uint16_t report_size, HIDLogicalRange logical_range);
-      const uint8_t report_size; // in bits
+struct HIDFieldSchema {
+  uint16_t id{0};
+  HIDReportKind kind{HIDReportKind::INPUT};
+  uint8_t report_id{0};
+  uint16_t collection_id{HIDCollectionSchema::NO_PARENT};
+  uint32_t bit_offset{0};
+  uint32_t report_size{0};
+  uint32_t report_count{0};
+  uint16_t flags{0};
+  HIDRange logical{};
+  HIDRange physical{};
+  int8_t unit_exponent{0};
+  uint32_t unit{0};
+  std::vector<HIDUsage> usages;
+  std::vector<std::vector<HIDUsage>> alternative_usages;
+  HIDUsage usage_minimum{};
+  HIDUsage usage_maximum{};
+  bool has_usage_range{false};
+  std::vector<uint32_t> string_indices;
+  uint32_t string_minimum{0};
+  uint32_t string_maximum{0};
+  bool has_string_range{false};
+  std::vector<uint32_t> designator_indices;
+  uint32_t designator_minimum{0};
+  uint32_t designator_maximum{0};
+  bool has_designator_range{false};
 
-    protected:
-      const HIDUsageCollection *usage_collection;
-      const uint8_t report_count;
-      const uint8_t report_id;
-      const HIDLogicalRange logical_range;
-      const uint8_t report_offset; // in bits
-      std::vector<HIDReportItemValue> last_values;
-    };
+  bool is_constant() const { return (this->flags & 0x01U) != 0; }
+  bool is_variable() const { return (this->flags & 0x02U) != 0; }
+  bool is_relative() const { return (this->flags & 0x04U) != 0; }
+  HIDUsage usage_at(uint32_t index, bool repeat_last) const;
+};
 
-    class HIDInputReportArray : public HIDInputReportItem
-    {
-    public:
-      using HIDInputReportItem::HIDInputReportItem;
-      ~HIDInputReportArray(){};
-      std::vector<HIDReportItemValue> parse(uint8_t *hid_report_data);
+struct HIDReportSchema {
+  HIDReportKind kind{HIDReportKind::INPUT};
+  uint8_t report_id{0};
+  uint32_t bit_size{0};
+  std::vector<uint16_t> field_ids;
 
-    protected:
-    };
+  size_t byte_size() const { return (static_cast<size_t>(this->bit_size) + 7U) / 8U; }
+};
 
-    class HIDInputReportVariable : public HIDInputReportItem
-    {
-    public:
-     using HIDInputReportItem::HIDInputReportItem;
-      ~HIDInputReportVariable(){};
-      std::vector<HIDReportItemValue> parse(uint8_t *hid_report_datsa);
-    };
+struct HIDParserDiagnostic {
+  size_t offset{0};
+  bool error{false};
+  std::string message;
+};
 
-    class HIDInputReport
-    {
-    public:
-      HIDInputReport(uint8_t report_id) : report_id(report_id){};
-      ~HIDInputReport()
-      {
-        for (auto &item : items)
-        {
-          delete item;
-        }
-      };
-      void push_back(HIDInputReportItem *item);
-      void add_padding(uint8_t padding_size);
-      uint8_t get_next_offset();
-      std::vector<HIDReportItemValue> parse(uint8_t *hid_report_data);
+struct HIDReportItemValue {
+  enum class Aggregation : uint8_t { PASSTHROUGH, SUM, LATEST };
 
-    protected:
-      std::vector<HIDInputReportItem *> items;
-      const uint8_t report_id;
-      uint8_t report_size = 0;
-    };
+  HIDUsage usage{};
+  HIDUsage application_usage{};
+  int64_t value{0};
+  int64_t raw_value{0};
+  uint16_t characteristic_handle{0};
+  uint32_t field_id{0};
+  uint16_t collection_id{HIDCollectionSchema::NO_PARENT};
+  uint8_t report_id{0};
+  bool is_relative{false};
+  Aggregation aggregation{Aggregation::PASSTHROUGH};
 
-    class HIDReportMap
-    {
-    public:
-      HIDReportMap(std::map<uint8_t, HIDInputReport *> input_reports)
-          : input_reports(input_reports) {}
-      ~HIDReportMap()
-      {
-        for (auto &input_report : input_reports)
-        {
-          delete input_report.second;
-        }
-      };
-      static HIDReportMap *parse_report_map_data(
-          const uint8_t *report_map_data, uint16_t report_map_size);
-      static void esp_logd_report_map(const uint8_t *report_map_data, uint16_t report_map_size);
-      static int32_t parse_item(const uint8_t **report_map_data, uint16_t *report_map_size, uint8_t report_item_info);
-      std::vector<HIDReportItemValue> parse(uint8_t *hid_report_data);
+  HIDReportItemValue() = default;
+  HIDReportItemValue(HIDUsage usage, int64_t value, int64_t raw_value)
+      : usage(usage), value(value), raw_value(raw_value) {}
+  std::string to_string() const;
+};
 
-    protected:
-      const std::map<uint8_t, HIDInputReport *> input_reports;
-    };
-  } // namespace ble_client_hid
-} // namespace esphome
+class HIDReportMap {
+ public:
+  static constexpr size_t MAX_DESCRIPTOR_BYTES = 4096;
+  static constexpr size_t MAX_REPORTS = 64;
+  static constexpr size_t MAX_FIELDS = 512;
+  static constexpr size_t MAX_COLLECTIONS = 128;
+  static constexpr size_t MAX_COLLECTION_DEPTH = 32;
+  static constexpr size_t MAX_GLOBAL_STACK_DEPTH = 16;
+  static constexpr uint32_t MAX_REPORT_BITS = 32768;
+  static constexpr uint32_t MAX_REPORT_COUNT = 4096;
+
+  static HIDReportMap *parse_report_map_data(const uint8_t *data, size_t length);
+  static void esp_logd_report_map(const uint8_t *data, size_t length);
+
+  std::vector<HIDReportItemValue> parse(const HIDReportSource &source, const uint8_t *data, size_t length,
+                                        bool *recognized = nullptr, HIDDecodeStatus *status = nullptr);
+  const HIDReportSchema *find_report(HIDReportKind kind, uint8_t report_id) const;
+  const HIDFieldSchema *find_field(uint16_t field_id) const;
+  HIDUsage application_usage(uint16_t collection_id) const;
+  void reset_runtime_state();
+
+  const std::vector<HIDReportSchema> &reports() const { return this->reports_; }
+  const std::vector<HIDFieldSchema> &fields() const { return this->fields_; }
+  const std::vector<HIDCollectionSchema> &collections() const { return this->collections_; }
+  const std::vector<HIDParserDiagnostic> &diagnostics() const { return this->diagnostics_; }
+  bool valid() const { return this->valid_; }
+  bool uses_report_ids() const { return this->uses_report_ids_; }
+
+ private:
+  struct FieldRuntime {
+    std::vector<int64_t> last_values;
+    std::multimap<HIDUsage, int64_t> active_array_usages;
+    bool initialized{false};
+  };
+
+  std::vector<HIDReportItemValue> parse_input_(const HIDReportSchema &report, const uint8_t *data, size_t length);
+  static bool read_bits_(const uint8_t *data, size_t length, uint32_t bit_offset, uint32_t bit_size,
+                         bool signed_value, int64_t *value);
+  void add_diagnostic_(size_t offset, bool error, std::string message);
+
+  std::vector<HIDReportSchema> reports_;
+  std::vector<HIDFieldSchema> fields_;
+  std::vector<HIDCollectionSchema> collections_;
+  std::vector<HIDParserDiagnostic> diagnostics_;
+  std::map<uint16_t, FieldRuntime> runtime_;
+  bool valid_{true};
+  bool uses_report_ids_{false};
+};
+
+}  // namespace ble_client_hid
+}  // namespace esphome

@@ -1,0 +1,44 @@
+substitutions:
+  build_board: esp32-s3-devkitc-1
+
+esphome:
+  name: ble-hid-build-test
+  build_flags:
+    - -Werror
+
+esp32:
+  board: ${build_board}
+  framework:
+    type: esp-idf
+
+logger:
+
+wifi:
+  ssid: build-test
+  password: build-test-password
+
+api:
+  homeassistant_services: true
+
+external_components:
+  - source:
+      type: local
+      path: ../components
+    components: [ble_client_hid]
+
+esp32_ble_tracker:
+
+ble_client:
+  - id: test_ble_client
+    mac_address: "00:11:22:33:44:55"
+  - id: second_test_ble_client
+    mac_address: "00:11:22:33:44:66"
+
+ble_client_hid:
+  - id: test_ble_hid
+    ble_client_id: test_ble_client
+    event_sampling_interval: 500us
+  - id: second_test_ble_hid
+    ble_client_id: second_test_ble_client
+    discovery_mode: forensic
+    protocol_mode: report
